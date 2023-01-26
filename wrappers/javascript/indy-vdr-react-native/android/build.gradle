@@ -1,4 +1,5 @@
 import org.apache.tools.ant.filters.ReplaceTokens
+import org.apache.tools.ant.taskdefs.condition.Os
 import java.nio.file.Paths
 
 buildscript {
@@ -9,99 +10,128 @@ buildscript {
   }
 
   dependencies {
-    classpath 'com.android.tools.build:gradle:4.2.2'
-    classpath 'de.undercouch:gradle-download-task:4.1.2'
+    classpath 'com.android.tools.build:gradle:7.2.2'
   }
 }
 
-apply plugin: 'com.android.library'
-apply plugin: 'de.undercouch.download'
+def resolveBuildType() {
+    Gradle gradle = getGradle()
+    String tskReqStr = gradle.getStartParameter().getTaskRequests()['args'].toString()
 
-def getExtOrDefault(name) {
-  return rootProject.ext.get(name)
+    return tskReqStr.contains('Release') ? 'release' : 'debug'
 }
 
-def getExtOrIntegerDefault(name) {
-  return rootProject.ext.get(name)
+
+def isNewArchitectureEnabled() {
+  // To opt-in for the New Architecture, you can either:
+  // - Set `newArchEnabled` to true inside the `gradle.properties` file
+  // - Invoke gradle with `-newArchEnabled=true`
+  // - Set an environment variable `ORG_GRADLE_PROJECT_newArchEnabled=true`
+  return project.hasProperty("newArchEnabled") && project.newArchEnabled == "true"
 }
 
-static def findNodeModules(baseDir, isHermesEnabled) {
-  def basePath = baseDir.toPath().normalize()
-  while (basePath) {
-    def nodeModulesPath = Paths.get(basePath.toString(), "node_modules")
-    def reactNativePath = Paths.get(nodeModulesPath.toString(), "react-native")
-    def jscAndroidPath = Paths.get(nodeModulesPath.toString(), "jsc-android/dist/org/webkit/android-jsc")
-    if (nodeModulesPath.toFile().exists() && reactNativePath.toFile().exists()) {
-    if(isHermesEnabled || (!isHermesEnabled && jscAndroidPath.toFile().exists()))
-      return nodeModulesPath.toString()
+def resolveReactNativeDirectory() {
+    def reactNativeLocation = safeAppExtGet("REACT_NATIVE_NODE_MODULES_DIR", null)
+    if (reactNativeLocation != null) {
+        return file(reactNativeLocation)
     }
-    basePath = basePath.getParent()
-  }
-  throw new GradleException("aries askar: Failed to find node_modules path!")
+
+    // monorepo workaround
+    // react-native can be hoisted or in project's own node_modules
+    def reactNativeFromProjectNodeModules = file("${rootProject.projectDir}/../node_modules/react-native")
+    if (reactNativeFromProjectNodeModules.exists()) {
+        return reactNativeFromProjectNodeModules
+    }
+
+    throw new GradleException(
+        "[IndyVdr] Unable to resolve react-native location in " +
+        "node_modules. You should project extension property (in app/build.gradle) " +
+        "`REACT_NATIVE_NODE_MODULES_DIR` with path to react-native."
+    )
 }
 
-def isHermesEnabled = "False"
-rootProject.getSubprojects().forEach({project ->
-  if (project.plugins.hasPlugin("com.android.application")) {
-    isHermesEnabled = project.ext.react.enableHermes
+def toPlatformFileString(String path) {
+  if (Os.isFamily(Os.FAMILY_WINDOWS)) {
+      path = path.replace(File.separatorChar, '/' as char)
   }
-})
-def nodeModules = findNodeModules(projectDir, isHermesEnabled);
+  return path
+}
 
-def reactNative = new File("$nodeModules/react-native")
+if (isNewArchitectureEnabled()) {
+  apply plugin: 'com.facebook.react'
+}
+apply plugin: 'com.android.library'
 
-def reactProperties = new Properties()
-file("$nodeModules/react-native/ReactAndroid/gradle.properties").withInputStream { reactProperties.load(it) }
-def REACT_NATIVE_VERSION = reactProperties.getProperty("VERSION_NAME").split("\\.")[1].toInteger()
+def safeExtGet(prop, fallback) {
+  rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
+}
+
+def safeAppExtGet(prop, fallback) {
+    def appProject = rootProject.allprojects.find { it.plugins.hasPlugin('com.android.application') }
+    appProject?.ext?.has(prop) ? appProject.ext.get(prop) : fallback
+}
+
+def reactNativeArchitectures() {
+  def value = project.getProperties().get("reactNativeArchitectures")
+  return value ? value.split(",") : ["armeabi-v7a", "x86", "x86_64", "arm64-v8a"]
+}
+
+def reactNativeRootDir = resolveReactNativeDirectory()
+
+repositories {
+  mavenCentral()
+}
 
 android {
-  
-  compileSdkVersion getExtOrIntegerDefault('compileSdkVersion')
-  buildToolsVersion getExtOrDefault('buildToolsVersion')
-  
-  defaultConfig {
-    minSdkVersion 21 
-    targetSdkVersion getExtOrIntegerDefault('targetSdkVersion')
-    versionCode 1
-    versionName "1.0"
-    
-    externalNativeBuild {
-        cmake {
-            cppFlags "-O2", "-fexceptions", "-frtti", "-std=c++1y", "-DONANDROID"
-            abiFilters 'x86', 'x86_64', 'armeabi-v7a', 'arm64-v8a'
-            arguments '-DANDROID_STL=c++_shared',
-              "-DNODE_MODULES_DIR=${nodeModules}"
-        }
-    }
-    
+  compileSdkVersion safeExtGet("compileSdkVersion", 28)
+
+  // Used to override the NDK path/version on internal CI or by allowing
+  // users to customize the NDK path/version from their root project (e.g. for M1 support)
+  if (rootProject.hasProperty("ndkPath")) {
+    ndkPath rootProject.ext.ndkPath
   }
-  
-  externalNativeBuild {
-      cmake {
-          path "CMakeLists.txt"
-      }
+  if (rootProject.hasProperty("ndkVersion")) {
+    ndkVersion rootProject.ext.ndkVersion
   }
 
-  packagingOptions {
-    excludes = ["**/libc++_shared.so", "**/libfbjni.so", "**/libjsi.so", "**/libreactnativejni.so", "**/libjscexecutor.so", "**/libhermes.so"]
+  buildFeatures {
+    prefab true
   }
   
-  buildTypes {
-    release {
-      minifyEnabled false
+  defaultConfig {
+    minSdkVersion safeExtGet('minSdkVersion', 16)
+    targetSdkVersion safeExtGet('targetSdkVersion', 28)
+    versionCode 1
+    versionName "1.0"
+    buildConfigField "boolean", "IS_NEW_ARCHITECTURE_ENABLED", isNewArchitectureEnabled().toString()
+    externalNativeBuild {
+      cmake {
+        cppFlags "-O2 -frtti -fexceptions -Wall -Wno-unused-variable -fstack-protector-all"
+        arguments "-DANDROID_STL=c++_shared",
+          "-DREACT_NATIVE_DIR=${toPlatformFileString(reactNativeRootDir.path)}"
+        abiFilters (*reactNativeArchitectures())
+      }
     }
   }
-  lintOptions {
-    disable 'GradleCompatible'
-  }
+  
   compileOptions {
     sourceCompatibility JavaVersion.VERSION_1_8
     targetCompatibility JavaVersion.VERSION_1_8
   }
 
-  configurations {
-    extractHeaders
-    extractJNI
+  externalNativeBuild {
+    cmake {
+      path "CMakeLists.txt"
+    }
+  }
+
+  packagingOptions {
+    doNotStrip resolveBuildType() == 'debug' ? "**/**/*.so" : ''
+    excludes = [
+            "META-INF",
+            "META-INF/**",
+            "**/libjsi.so",
+    ]
   }
 
   sourceSets {
@@ -111,145 +141,22 @@ android {
   }
 }
 
-repositories {
-  mavenCentral()
-  google()
-
-  def found = false
-  def defaultDir = null
-  def androidSourcesName = 'React Native sources'
-
-  if (rootProject.ext.has('reactNativeAndroidRoot')) {
-    defaultDir = rootProject.ext.get('reactNativeAndroidRoot')
-  } else {
-    defaultDir = file("$nodeModules/react-native/android")
-  }
-
-  if (defaultDir.exists()) {
-    maven {
-      url defaultDir.toString()
-      name androidSourcesName
-    }
-
-    logger.info(":${project.name}:reactNativeAndroidRoot ${defaultDir.canonicalPath}")
-    found = true
-  } else {
-    def parentDir = rootProject.projectDir
-
-    1.upto(5, {
-      if (found) return true
-      parentDir = parentDir.parentFile
-
-      def androidSourcesDir = new File(
-              parentDir,
-              'node_modules/react-native'
-      )
-
-      def androidPrebuiltBinaryDir = new File(
-              parentDir,
-              'node_modules/react-native/android'
-      )
-
-      if (androidPrebuiltBinaryDir.exists()) {
-        maven {
-          url androidPrebuiltBinaryDir.toString()
-          name androidSourcesName
-        }
-
-        logger.info(":${project.name}:reactNativeAndroidRoot ${androidPrebuiltBinaryDir.canonicalPath}")
-        found = true
-      } else if (androidSourcesDir.exists()) {
-        maven {
-          url androidSourcesDir.toString()
-          name androidSourcesName
-        }
-
-        logger.info(":${project.name}:reactNativeAndroidRoot ${androidSourcesDir.canonicalPath}")
-        found = true
-      }
-    })
-  }
-
-  if (!found) {
-    throw new GradleException(
-            "${project.name}: unable to locate React Native android sources. " +
-                    "Ensure you have you installed React Native as a dependency in your project and try again."
-    )
-  }
-}
-
-
 dependencies {
-  // noinspection GradleDynamicVersion
-  api 'com.facebook.react:react-native:+'
   //noinspection GradleDynamicVersion
-  extractHeaders("com.facebook.fbjni:fbjni:+:headers")
-  //noinspection GradleDynamicVersion
-  extractJNI("com.facebook.fbjni:fbjni:+")
-
-  def buildType = "debug"
-  tasks.all({ task ->
-    if (task.name == "buildCMakeRelease") {
-      buildType = "release"
-    }
-  })
-  def rnAarMatcher = "**/react-native/**/*${buildType}.aar"
-  if (REACT_NATIVE_VERSION < 69) {
-      rnAarMatcher = "**/react-native/**/*.aar"
-  }
-  def rnAAR = fileTree("$reactNative/android").matching({ it.include rnAarMatcher }).singleFile
-
-  if(!isHermesEnabled) {
-    def jscAAR = fileTree("${nodeModules}/jsc-android/dist/org/webkit/android-jsc").matching({ it.include "**/**/*.aar" }).singleFile
-    extractJNI(files(jscAAR))
-  }
-
-  extractJNI(files(rnAAR))
+  implementation 'com.facebook.react:react-android:+'
 }
 
-def downloadsDir = new File("$buildDir/downloads")
-
-task createNativeDepsDirectories {
-  doLast {
-    downloadsDir.mkdirs()
-  }
-}
-
-
-task extractAARHeaders {
-  doLast {
-    configurations.extractHeaders.files.each {
-      def file = it.absoluteFile
-      copy {
-        from zipTree(file)
-        into "$buildDir/$file.name"
-        include "**/*.h"
-      }
-    }
-  }
-}
-
-extractAARHeaders.mustRunAfter createNativeDepsDirectories
-
-task extractJNIFiles {
-  doLast {
-    configurations.extractJNI.files.each {
-      def file = it.absoluteFile
-
-      copy {
-        from zipTree(file)
-        into "$buildDir/$file.name"
-        include "jni/**/*"
-      }
-    }
-  }
-}
-
-extractJNIFiles.mustRunAfter extractAARHeaders
-
+// Resolves "LOCAL_SRC_FILES points to a missing file, Check that libfb.so exists or that its path is correct".
 tasks.whenTaskAdded { task ->
-  if (!task.name.contains('Clean') && (task.name.contains('externalNative') || task.name.contains('CMake'))) {
-    task.dependsOn(extractAARHeaders)
-    task.dependsOn(extractJNIFiles)
+  if (task.name.contains("configureCMakeDebug")) {
+    rootProject.getTasksByName("packageReactNdkDebugLibs", true).forEach {
+      task.dependsOn(it)
+    }
+  }
+  // We want to add a dependency for both configureCMakeRelease and configureCMakeRelWithDebInfo
+  if (task.name.contains("configureCMakeRel")) {
+    rootProject.getTasksByName("packageReactNdkReleaseLibs", true).forEach {
+      task.dependsOn(it)
+    }
   }
 }
